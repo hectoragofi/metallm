@@ -46,10 +46,11 @@ if [ -f src/efi_main.c ] && [ -f src/font.h ]; then
   cc -c src/fs.c       -o build/obj/fs.o
   cc -c src/md.c       -o build/obj/md.o
   cc -c src/settings.c -o build/obj/settings.o
+  cc -c src/sbat.c     -o build/obj/sbat.o
   cc -c src/efi_main.c -o build/obj/efi_main.o
   cc -DFORCE_SIPI -c src/efi_main.c -o build/obj/efi_main_sipi.o
   cc -c src/ap_tramp.S -o build/obj/ap_tramp.o
-  EFI_OBJS="$ENGINE_OBJS build/obj/console.o build/obj/cpu.o build/obj/fs.o build/obj/md.o build/obj/settings.o build/obj/ap_tramp.o"
+  EFI_OBJS="$ENGINE_OBJS build/obj/console.o build/obj/cpu.o build/obj/fs.o build/obj/md.o build/obj/settings.o build/obj/sbat.o build/obj/ap_tramp.o"
   "$LINK" -nologo -subsystem:efi_application -entry:efi_main -nodefaultlib \
     -out:build/BOOTX64.EFI $EFI_OBJS build/obj/efi_main.o
   # test variant: skips firmware MP services and always wakes cores via APIC

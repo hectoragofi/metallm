@@ -7,3 +7,5 @@ huggingface_hub>=0.30
 # tools/gen_font.py
 pillow>=10.0
 fonttools>=4.40
+# tools/secureboot.py
+cryptography>=41
