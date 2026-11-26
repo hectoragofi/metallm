@@ -481,6 +481,20 @@ static int read_key(EFI_INPUT_KEY* k, int wait) {
         if (!wait) return 0;
     }
 }
+// While the model runs (prompt and reply): every pending wheel movement and key, so scrolling
+// keeps up however slow a token is. Called by the engine between layers (g_poll) and once per
+// token; at most every ~15 ms. Esc is remembered in stop_req, other keys are dropped.
+static volatile int stop_req;
+static u64 poll_tsc, poll_every;
+static void poll_input(void) {
+    u64 t = rdtsc();
+    if (t - poll_tsc < poll_every) return;
+    poll_tsc = t;
+    int z = wheel(); if (z) scroll_view(z);
+    EFI_INPUT_KEY k;
+    while (ST->ConIn->ReadKeyStroke(ST->ConIn, &k) == EFI_SUCCESS)
+        if (!scroll_key(&k) && k.ScanCode == SCAN_ESC) stop_req = 1;
+}
 // For menus: every key, nothing intercepted; the wheel moves the selection.
 static void read_key_raw(EFI_INPUT_KEY* k) {
     for (;;) {
@@ -1092,6 +1106,8 @@ static void chat(void) {
         }
         first = 0;
         tr_turn(1, line, n);
+        stop_req = 0; poll_every = tsc_hz / 64; poll_tsc = 0;
+        g_poll = poll_input;   // scroll keys work while the model runs
         // prefill
         float* lg = eng_forward_batch(&E, toks, nt, pos, 0);
         pos += nt;
@@ -1114,12 +1130,13 @@ static void chat(void) {
             gen++;
             con_flush();
             if (gen % 8 == 0) show_stats(gen / secs(rdtsc() - t0), pos);
-            EFI_INPUT_KEY k;
-            if (read_key(&k, 0) && k.ScanCode == SCAN_ESC) { md_finish(); say(COL_DIM, "stopped", 0); break; }
+            poll_tsc = 0; poll_input();
+            if (stop_req) { md_finish(); say(COL_DIM, "stopped", 0); break; }
             if (pos >= E.max_seq - 1) { md_finish(); say(COL_DIM, "context full", 0); break; }
             if (S.max_reply && gen >= S.max_reply) { md_finish(); say(COL_DIM, "reply length limit", 0); break; }
             lg = eng_forward(&E, t, pos++, 1);
         }
+        g_poll = 0;
         md_finish();
         // the reply text went straight into the transcript; register it as a turn
         u32 rl = tr_n - reply0; tr_n = reply0;

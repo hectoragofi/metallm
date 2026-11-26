@@ -4,6 +4,7 @@
 
 static void parfor_serial(task_fn fn, void* ctx, int n) { fn(ctx, 0, n); }
 parfor_fn g_parfor = parfor_serial;
+void (*g_poll)(void);
 
 #define BMAX 64        // max tokens per batched forward step (longer batches are chunked)
 #define REC_MAX 16     // max tokens in a speculative record log
@@ -571,6 +572,7 @@ static void forward_chunk(Engine* e, const int* toks, int n, int pos, int want, 
         for (usize i = 0; i < (usize)n * e->hidden; i++) e->hb[i] = siluf(e->hb[i]) * e->hb2[i];
         MM1(e, e->hb, e->hidden, n, &ly->w2, e->xb, dim);
         for (usize i = 0; i < (usize)n * dim; i++) e->x[i] += e->xb[i];
+        if (g_poll) g_poll();
     }
     if (e->rec_on) e->rec_n += n;
     e->n_past = pos + n;

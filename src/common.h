@@ -23,3 +23,5 @@ static inline float m_sqrtf(float x) { return __builtin_sqrtf(x); }  // -fno-mat
 typedef void (*task_fn)(void* ctx, int i0, int i1);
 typedef void (*parfor_fn)(task_fn fn, void* ctx, int n);
 extern parfor_fn g_parfor;
+// ---- optional hook the engine calls between layers (the app polls keyboard/mouse there) ----
+extern void (*g_poll)(void);
