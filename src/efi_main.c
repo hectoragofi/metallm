@@ -1001,6 +1001,8 @@ static const char HELP[] =
     "/remember text    add a line to MEMORY.TXT, the model reads it in new chats\n"
     "/memory           show MEMORY.TXT\n"
     "/forget           clear MEMORY.TXT\n"
+    "/off              save the chat and power off\n"
+    "/reboot           save the chat and restart\n"
     "Esc               stop a reply\n"
     "PgUp PgDn, arrows, mouse wheel   scroll\n"
     "Home End          top, bottom\n";
@@ -1084,6 +1086,14 @@ static void chat(void) {
             if ((k.UnicodeChar | 32) == 'y') {
                 if (fs_delete("\\MEMORY.TXT")) write_failed(); else { load_memory(); say(COL_DIM, "MEMORY.TXT cleared", 0); }
             } else say(COL_DIM, "kept", 0);
+            continue;
+        }
+        if (streq(line, n, "/off") || streq(line, n, "/shutdown") || streq(line, n, "/reboot")) {
+            int off = line[1] != 'r';
+            if (n_seg && save_chat()) write_failed();
+            say(COL_DIM, off ? "powering off" : "restarting", 0);
+            ST->RuntimeServices->ResetSystem(off ? EfiResetShutdown : EfiResetCold, EFI_SUCCESS, 0, 0);
+            say(COL_ERR, "the firmware didn't power off, hold the power button", 0);  // ResetSystem doesn't return
             continue;
         }
         if (streq(line, n, "/retry")) {
