@@ -44,20 +44,29 @@ static void s_mhz(Str* s, u32 mhz) {
 }
 
 // ---------------- multicore ----------------
-// Workers spin on job.gen. A parfor splits n items over the active slots (slot[w] >= 0);
-// a broadcast runs fn once on every started core (used for per-core settings like clocks).
+// Workers spin on job.gen. A parfor cuts n items into several chunks per active slot
+// (slot[w] >= 0) and the active cores take chunks from a shared counter until none are left, so
+// a slower core (an E-core on Intel hybrid CPUs, an SMT sibling, a core at a lower clock) just
+// takes fewer chunks instead of holding everyone up at the end.
+// A broadcast runs fn once on every started core (used for per-core settings like clocks).
+#define CHUNKS_PER_THREAD 8
 static struct {
-    volatile task_fn fn; void* volatile ctx; volatile int n;
+    volatile task_fn fn; void* volatile ctx; volatile int n, nchunks;
     volatile u32 gen, done, ready; volatile int bcast;
+    volatile int next __attribute__((aligned(64)));   // next chunk to take (own cache line)
     int nthreads, ncores;
     volatile int slot[MAX_THREADS];
 } job;
 static int g_boost_start;
 
-static void run_chunk(int s) {
-    int n = job.n, T = job.nthreads;
-    int a = (int)((i64)n * s / T), b = (int)((i64)n * (s + 1) / T);
-    if (a < b) job.fn(job.ctx, a, b);
+static void run_chunks(void) {
+    int n = job.n, nc = job.nchunks;
+    for (;;) {
+        int c = __atomic_fetch_add(&job.next, 1, __ATOMIC_RELAXED);
+        if (c >= nc) break;
+        int a = (int)((i64)n * c / nc), b = (int)((i64)n * (c + 1) / nc);
+        if (a < b) job.fn(job.ctx, a, b);
+    }
 }
 static void EFIAPI ap_worker(void* arg) {
     int w = (int)(usize)arg;
@@ -69,16 +78,18 @@ static void EFIAPI ap_worker(void* arg) {
         while ((g = __atomic_load_n(&job.gen, __ATOMIC_ACQUIRE)) == seen) cpu_pause();
         seen = g;
         if (job.bcast) job.fn(job.ctx, w, w + 1);
-        else { int s = job.slot[w]; if (s < 0) continue; run_chunk(s); }
+        else { if (job.slot[w] < 0) continue; run_chunks(); }
         __atomic_fetch_add(&job.done, 1, __ATOMIC_RELEASE);
     }
 }
 static void parfor_mp(task_fn fn, void* ctx, int n) {
     if (job.nthreads < 2 || n < job.nthreads * 2) { fn(ctx, 0, n); return; }
-    job.fn = fn; job.ctx = ctx; job.n = n; job.bcast = 0;
+    int nc = job.nthreads * CHUNKS_PER_THREAD; if (nc > n) nc = n;
+    job.fn = fn; job.ctx = ctx; job.n = n; job.nchunks = nc; job.bcast = 0;
+    __atomic_store_n(&job.next, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&job.done, 0, __ATOMIC_RELAXED);
     __atomic_fetch_add(&job.gen, 1, __ATOMIC_RELEASE);
-    run_chunk(0);
+    run_chunks();
     while (__atomic_load_n(&job.done, __ATOMIC_ACQUIRE) < (u32)(job.nthreads - 1)) cpu_pause();
 }
 static void broadcast(task_fn fn, void* ctx) {
@@ -1087,9 +1098,9 @@ static void chat(void) {
         // generate
         float temp = S.temp100 >= 0 ? S.temp100 / 100.0f : S.think ? 0.6f : 0.7f;
         float top_p = S.topp100 >= 0 ? S.topp100 / 100.0f : S.think ? 0.95f : 0.8f;
-        u64 t0 = rdtsc(); int gen = 0, thinking = 0;
+        u64 t0 = rdtsc(); int gen = 0, thinking = E.think_open;   // the prompt may already open <think>
         u32 reply0 = tr_n;
-        md_reset(COL_TEXT);
+        md_reset(thinking ? COL_DIM : COL_TEXT);
         for (;;) {
             int t = eng_sample(&E, lg, temp, top_p, S.topk, &rng);
             if (t == (int)E.h->tok_im_end || t == (int)E.h->tok_eot) break;

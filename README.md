@@ -105,7 +105,7 @@ and a speed estimate. Enter loads the highlighted one (the last one used, if it 
 |---|---|
 | `/clear` | new conversation |
 | `/retry` | new answer to your last message |
-| `/think` | step-by-step reasoning on/off |
+| `/think` | step-by-step reasoning on/off (shown dimmed, before the answer) |
 | `/temp 0.3` | randomness, 0 = always the same answer; `/temp` shows it |
 | `/settings` | settings and system info |
 | `/model` | switch model |
@@ -128,7 +128,9 @@ tables and LaTeX math (`$x^2$`, `\frac{a}{b}`, Greek letters and so on are shown
 go back. Saved to `SETTINGS.TXT` on the stick.
 
 - Temperature, Top-p, Top-k: sampling. "auto" uses the model's recommended values.
-- Thinking: step-by-step reasoning before the answer, off by default (same as `/think`).
+- Thinking: step-by-step reasoning before the answer, off by default (same as `/think`). The
+  reasoning is shown dimmed and is not saved in the chat file. This works for every model,
+  including Bonsai-8B, whose GGUF chat template always switches it off.
 - Reply length limit: stop a reply after this many tokens.
 - Use MEMORY.TXT: pass `MEMORY.TXT` to the model as its system prompt.
 - Autosave chats: write the chat to `CHATS\` after every reply.

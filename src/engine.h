@@ -137,6 +137,7 @@ typedef struct Engine {
     float* conv_log;
     int chat_style, pend, pend_first, pend_asst, pend_content, asst_pos, content_pos;
     const u8* think_sys; int think_sys_len;
+    int think_open;                            // last eng_chat_turn prompt ends inside <think>
     u8* textbuf; int textcap; int* tokbuf;
     // tokenizer
     const u32 *vocab_offs, *merges, *bytetok, *uranges;
@@ -165,6 +166,8 @@ int eng_encode(Engine* e, const u8* text, int len, int* out, int max_out);
 int eng_encode_special(Engine* e, const u8* text, int len, int* out, int max_out);
 const u8* eng_token_bytes(Engine* e, int id, int* len);
 // Tokens for one user turn (see "chat history" above). sys: optional system prompt (first=1 only).
+// Afterwards e->think_open says whether the prompt ends inside an open <think> block, i.e. the
+// reply starts with reasoning (Qwen3.5-style templates) rather than with a sampled <think>.
 int eng_chat_turn(Engine* e, const u8* sys, int sys_len, const u8* msg, int len, int first, int think, int* out, int max);
 // Kernel selection: ISA_* flags (0 = portable C). Returns the flags in use.
 int eng_set_isa(int flags);

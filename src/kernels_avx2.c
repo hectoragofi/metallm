@@ -111,8 +111,85 @@ static void mm_##TN(float* out, int ldo, const QMat* m, const QAct* a, int n, in
 KSET(T_Q8, q8_0, 0) KSET(T_Q8, q8_1, 1) KSET(T_Q8, q8_2, 2)
 KSET(T_Q4S, q4s_0, 0) KSET(T_Q4S, q4s_1, 1) KSET(T_Q4S, q4s_2, 2)
 KSET(T_Q4A, q4a_0, 0) KSET(T_Q4A, q4a_1, 1) KSET(T_Q4A, q4a_2, 2)
-KSET(T_Q1, q1_0, 0) KSET(T_Q1, q1_1, 1) KSET(T_Q1, q1_2, 2)
+KSET(T_Q1, q1_0, 0) KSET(T_Q1, q1_1, 1)   // gs 128 (the Bonsai models): mm_q1g below
 KSET(T_T2, t2_2, 2)
+
+// ---- 1-bit, groups of 128: several rows at once ----
+// Decode of the 1-bit models is limited by arithmetic, not memory, so this path trims the work
+// per 32-weight block: the group's 16 bytes of sign bits are loaded once and each block's bytes
+// are picked with one shuffle; without VNNI the sign is applied to the activations (no code
+// offset, no lane sums to add); the activation scale goes in with one FMA per block and the
+// weight scale once per group. About 1.4x faster than the generic path for one token.
+// NR rows share every activation load. Per (row, token) the arithmetic is the same whatever NR
+// and NT are, so batched and single-token results stay bit-identical.
+static inline __m256i q1_neg(__m256i g, int k) {   // block k of a group: 0xFF where the bit is 0 (weight -s)
+    const __m256i sh = _mm256_add_epi8(_mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                                        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3), _mm256_set1_epi8((char)(4 * k)));
+    const __m256i bits = _mm256_set1_epi64x(0x8040201008040201ll);
+    return _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(g, sh), bits), _mm256_setzero_si256());
+}
+// Per row: the operand that carries the signs. Per token: per 4-byte lane, sum(+-x).
+#ifdef AVXVNNI
+static inline __m256i q1_prep(__m256i neg) { return _mm256_andnot_si256(neg, _mm256_set1_epi8(2)); }   // codes {0, 2}
+static inline __m256i q1_dot(__m256i u, __m256i x, const int* nks) {   // 2 * sum(x where bit) - sum(x)
+    return _mm256_dpbusd_avx_epi32(_mm256_loadu_si256((const __m256i*)nks), u, x);
+}
+#else
+static inline __m256i q1_prep(__m256i neg) { return _mm256_or_si256(neg, _mm256_set1_epi8(1)); }      // -1 / +1
+static inline __m256i q1_dot(__m256i s, __m256i x, const int* nks) {
+    (void)nks;
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), _mm256_sign_epi8(x, s)), _mm256_set1_epi16(1));
+}
+#endif
+#define Q1KERN(NAME, NR_, NT_)                                                                                 \
+static inline __attribute__((always_inline)) void NAME(const QMat* m, int r, const QAct* a, int t0, int lda, float* out, int ldo) { \
+    enum { NR = NR_, NT = NT_ };                                                                               \
+    const int ng = m->cols / 128, rb = m->cols / 8, ldb = lda / 32, ldk = lda / 4;                             \
+    const u8* w = m->w + (usize)r * rb; const u16* sc = m->s + (usize)r * ng;                                  \
+    const i8* xq = a->q + (usize)t0 * lda; const float* xx = a->s + (usize)t0 * ldb;                           \
+    const int* xk = a->nks + (usize)t0 * ldk; (void)xk;                                                        \
+    __m256 acc[NR][NT];                                                                                        \
+    for (int i = 0; i < NR; i++) for (int t = 0; t < NT; t++) acc[i][t] = _mm256_setzero_ps();                 \
+    for (int g = 0; g < ng; g++) {                                                                             \
+        __m256i gb[NR]; __m256 ga[NR][NT];                                                                     \
+        for (int i = 0; i < NR; i++) gb[i] = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)(w + (usize)i * rb + g * 16))); \
+        _Pragma("unroll") for (int k = 0; k < 4; k++) {                                                        \
+            __m256i neg[NR];                                                                                   \
+            for (int i = 0; i < NR; i++) neg[i] = q1_prep(q1_neg(gb[i], k));                                   \
+            for (int t = 0; t < NT; t++) {                                                                     \
+                __m256i xv = _mm256_loadu_si256((const __m256i*)(xq + (usize)t * lda + g * 128 + k * 32));     \
+                __m256 xs = _mm256_broadcast_ss(xx + (usize)t * ldb + g * 4 + k);                              \
+                for (int i = 0; i < NR; i++) {                                                                 \
+                    __m256 d = _mm256_cvtepi32_ps(q1_dot(neg[i], xv, xk + (usize)t * ldk + g * 32 + k * 8));   \
+                    ga[i][t] = k ? _mm256_fmadd_ps(d, xs, ga[i][t]) : _mm256_mul_ps(d, xs);                    \
+                }                                                                                              \
+            }                                                                                                  \
+        }                                                                                                      \
+        for (int i = 0; i < NR; i++) {                                                                         \
+            __m256 ws = _mm256_set1_ps(cvth(sc[(usize)i * ng + g]));                                           \
+            for (int t = 0; t < NT; t++) acc[i][t] = _mm256_fmadd_ps(ga[i][t], ws, acc[i][t]);                 \
+        }                                                                                                      \
+    }                                                                                                          \
+    for (int i = 0; i < NR; i++) for (int t = 0; t < NT; t++) out[(usize)(t0 + t) * ldo + r + i] = hsum8(acc[i][t]); \
+}
+Q1KERN(q1g_r2, 2, 1) Q1KERN(q1g_r1, 1, 1)
+Q1KERN(q1g_t2, 1, 2) Q1KERN(q1g_t3, 1, 3) Q1KERN(q1g_t4, 1, 4)
+static void mm_q1g(float* out, int ldo, const QMat* m, const QAct* a, int n, int lda, int r0, int r1) {
+    if (n == 1) {
+        int r = r0;
+        for (; r + 2 <= r1; r += 2) q1g_r2(m, r, a, 0, lda, out, ldo);
+        for (; r < r1; r++) q1g_r1(m, r, a, 0, lda, out, ldo);
+        return;
+    }
+    for (int r = r0; r < r1; r++)
+        for (int t0 = 0; t0 < n; t0 += 4) {
+            int nt = n - t0 < 4 ? n - t0 : 4;
+            if (nt == 4) q1g_t4(m, r, a, t0, lda, out, ldo);
+            else if (nt == 3) q1g_t3(m, r, a, t0, lda, out, ldo);
+            else if (nt == 2) q1g_t2(m, r, a, t0, lda, out, ldo);
+            else q1g_r1(m, r, a, t0, lda, out, ldo);
+        }
+}
 
 typedef void (*mmfn)(float*, int, const QMat*, const QAct*, int, int, int, int);
 static mmfn pick(const QMat* m) {
@@ -121,7 +198,7 @@ static mmfn pick(const QMat* m) {
     case WT_Q8: return l == 0 ? mm_q8_0 : l == 1 ? mm_q8_1 : l == 2 ? mm_q8_2 : 0;
     case WT_Q4: if (m->m) return l == 0 ? mm_q4a_0 : l == 1 ? mm_q4a_1 : l == 2 ? mm_q4a_2 : 0;
                 return l == 0 ? mm_q4s_0 : l == 1 ? mm_q4s_1 : l == 2 ? mm_q4s_2 : 0;
-    case WT_Q1: return l == 0 ? mm_q1_0 : l == 1 ? mm_q1_1 : l == 2 ? mm_q1_2 : 0;
+    case WT_Q1: return l == 0 ? mm_q1_0 : l == 1 ? mm_q1_1 : l == 2 ? mm_q1g : 0;
     default: return l == 2 ? mm_t2_2 : 0;
     }
 }
