@@ -9,8 +9,9 @@ at boot.
 - An x86-64 PC or Intel Mac that boots UEFI with a graphics framebuffer (GOP).
 - AVX2 (Intel Haswell / AMD Zen and newer) for usable speed. Without it a plain C path runs,
   many times slower. AVX-512 and AVX-VNNI are used when present.
-- Secure Boot off: `BOOTX64.EFI` is not signed. On Intel Macs with a T2 chip, also allow
-  booting from external media in Startup Security Utility.
+- Secure Boot off, or set up the stick with your own signing key so it boots with Secure Boot on
+  (see [Secure Boot](#secure-boot)). On Intel Macs with a T2 chip, also allow booting from
+  external media in Startup Security Utility.
 - RAM for the model file plus its context (see the table below). The model list at boot greys
   out what doesn't fit.
 - A USB stick formatted FAT32.
@@ -99,13 +100,54 @@ Qwen3.5 and the 27B Bonsai use full attention in only every fourth layer, so the
 With more than one model the app shows a list: size, whether it fits in this machine's memory,
 and a speed estimate. Enter loads the highlighted one (the last one used, if it still fits).
 
+## Secure Boot
+
+The plain `BOOTX64.EFI` is unsigned, so it only boots with Secure Boot off. If you also use
+Windows on the machine, turning Secure Boot off and on again can cost you the Windows Hello PIN
+(and with BitLocker, a recovery key prompt): Windows sees a change in the firmware security
+state. To avoid that, leave Secure Boot on and boot metallm through shim with your own key:
+
+```
+python tools/secureboot.py keygen        # once; needs: pip install cryptography
+sh build.sh
+python tools/secureboot.py stick E:\     # E: is the stick; copy the model files as usual
+```
+
+`stick` signs `build/BOOTX64.EFI` with `keys/MOK.key` and puts it behind shim on the stick:
+
+```
+EFI\BOOT\BOOTX64.EFI     shim, signed by Microsoft (downloaded from Ubuntu's shim-signed package)
+EFI\BOOT\mmx64.efi       MokManager (same package)
+EFI\BOOT\grubx64.efi     metallm, signed with your key (shim starts this file name)
+METALLM.CER               your certificate
+```
+
+First boot on each machine: shim says "Verification failed: (0x1A) Security Violation" because it
+doesn't know your key yet. Press Enter, then any key within 10 seconds ("Press any key to
+perform MOK management"), then: Enroll key from disk, pick the stick, `METALLM.CER`,
+Continue, Yes, Reboot. After that the stick boots straight into metallm, and so does every build
+you sign with the same key. Run `stick` again after each rebuild.
+
+- The firmware must trust the Microsoft UEFI CA (the "3rd party" CA). Most PCs do. Some
+  laptops (Secured-core ones, Surface, some Lenovo and Dell models) ship with it off; the option
+  is called something like "Allow Microsoft 3rd Party UEFI CA". Changing it is a one-time
+  change to Secure Boot's key database. Have your BitLocker recovery key at hand, and you may
+  have to set up the Windows PIN again once.
+- Enrolling the key only touches shim's own list (MokList), not the firmware's keys, so
+  Windows doesn't notice.
+- `keys/` is in `.gitignore`. Keep `MOK.key` private: anything signed with it boots on every
+  machine where you enrolled `METALLM.CER`. To remove it, use MokManager or
+  `mokutil --delete` from Linux.
+- `python tools/secureboot.py sign IN.EFI OUT.EFI` only signs a file (Authenticode, SHA-256).
+  The signer is plain Python, so it works on Windows without `sbsign`.
+
 ## Using it
 
 | Command / key | |
 |---|---|
 | `/clear` | new conversation |
 | `/retry` | new answer to your last message |
-| `/think` | step-by-step reasoning on/off |
+| `/think` | step-by-step reasoning on/off (shown dimmed, before the answer) |
 | `/temp 0.3` | randomness, 0 = always the same answer; `/temp` shows it |
 | `/settings` | settings and system info |
 | `/model` | switch model |
@@ -128,7 +170,9 @@ tables and LaTeX math (`$x^2$`, `\frac{a}{b}`, Greek letters and so on are shown
 go back. Saved to `SETTINGS.TXT` on the stick.
 
 - Temperature, Top-p, Top-k: sampling. "auto" uses the model's recommended values.
-- Thinking: step-by-step reasoning before the answer, off by default (same as `/think`).
+- Thinking: step-by-step reasoning before the answer, off by default (same as `/think`). The
+  reasoning is shown dimmed and is not saved in the chat file. This works for every model,
+  including Bonsai-8B, whose GGUF chat template always switches it off.
 - Reply length limit: stop a reply after this many tokens.
 - Use MEMORY.TXT: pass `MEMORY.TXT` to the model as its system prompt.
 - Autosave chats: write the chat to `CHATS\` after every reply.
@@ -212,6 +256,8 @@ prints the size and weight mix of a model file.
 - `src/md.c`: markdown and LaTeX formatting while a reply streams
 - `src/fs.c`, `src/settings.c`: files on the stick, `SETTINGS.TXT`
 - `src/ap_tramp.S`: starts the other cores directly if the firmware won't
+- `src/sbat.c`: SBAT metadata, required by shim (Secure Boot)
+- `tools/secureboot.py`: signing key, Authenticode signer, shim stick setup
 - `src/console.c`, `src/font.h`: framebuffer text with scrollback, themes
 - `export.py`, `gguf_read.py`, `bin_info.py`: model conversion
 

@@ -257,8 +257,12 @@ int eng_chat_turn(Engine* e, const u8* sys, int sys_len, const u8* msg, int len,
     sb_str(&sb, "<|im_start|>user\n"); sb_put(&sb, m, ml); sb_str(&sb, "<|im_end|>\n");
     int gen_at = sb.n;
     sb_str(&sb, "<|im_start|>assistant\n");
-    if (st == CS_NOTHINK || !think) sb_str(&sb, "<think>\n\n</think>\n\n");
-    else if (st != CS_QWEN3) sb_str(&sb, "<think>\n");
+    // CS_NOTHINK: the template always closes an empty <think> block (the Bonsai GGUFs do this).
+    // The weights still come from a Qwen thinking model, so with thinking on the block is left
+    // open, as the Qwen3.5 templates do; earlier replies are rewritten the same way either way.
+    e->think_open = 0;
+    if (!think) sb_str(&sb, "<think>\n\n</think>\n\n");
+    else if (st != CS_QWEN3) { sb_str(&sb, "<think>\n"); e->think_open = 1; }
     int n = eng_encode_special(e, sb.p, sb.n, out, max);
     // token index just after the generation prompt's <|im_start|>
     int asst = n; (void)gen_at;

@@ -44,20 +44,29 @@ static void s_mhz(Str* s, u32 mhz) {
 }
 
 // ---------------- multicore ----------------
-// Workers spin on job.gen. A parfor splits n items over the active slots (slot[w] >= 0);
-// a broadcast runs fn once on every started core (used for per-core settings like clocks).
+// Workers spin on job.gen. A parfor cuts n items into several chunks per active slot
+// (slot[w] >= 0) and the active cores take chunks from a shared counter until none are left, so
+// a slower core (an E-core on Intel hybrid CPUs, an SMT sibling, a core at a lower clock) just
+// takes fewer chunks instead of holding everyone up at the end.
+// A broadcast runs fn once on every started core (used for per-core settings like clocks).
+#define CHUNKS_PER_THREAD 8
 static struct {
-    volatile task_fn fn; void* volatile ctx; volatile int n;
+    volatile task_fn fn; void* volatile ctx; volatile int n, nchunks;
     volatile u32 gen, done, ready; volatile int bcast;
+    volatile int next __attribute__((aligned(64)));   // next chunk to take (own cache line)
     int nthreads, ncores;
     volatile int slot[MAX_THREADS];
 } job;
 static int g_boost_start;
 
-static void run_chunk(int s) {
-    int n = job.n, T = job.nthreads;
-    int a = (int)((i64)n * s / T), b = (int)((i64)n * (s + 1) / T);
-    if (a < b) job.fn(job.ctx, a, b);
+static void run_chunks(void) {
+    int n = job.n, nc = job.nchunks;
+    for (;;) {
+        int c = __atomic_fetch_add(&job.next, 1, __ATOMIC_RELAXED);
+        if (c >= nc) break;
+        int a = (int)((i64)n * c / nc), b = (int)((i64)n * (c + 1) / nc);
+        if (a < b) job.fn(job.ctx, a, b);
+    }
 }
 static void EFIAPI ap_worker(void* arg) {
     int w = (int)(usize)arg;
@@ -69,16 +78,18 @@ static void EFIAPI ap_worker(void* arg) {
         while ((g = __atomic_load_n(&job.gen, __ATOMIC_ACQUIRE)) == seen) cpu_pause();
         seen = g;
         if (job.bcast) job.fn(job.ctx, w, w + 1);
-        else { int s = job.slot[w]; if (s < 0) continue; run_chunk(s); }
+        else { if (job.slot[w] < 0) continue; run_chunks(); }
         __atomic_fetch_add(&job.done, 1, __ATOMIC_RELEASE);
     }
 }
 static void parfor_mp(task_fn fn, void* ctx, int n) {
     if (job.nthreads < 2 || n < job.nthreads * 2) { fn(ctx, 0, n); return; }
-    job.fn = fn; job.ctx = ctx; job.n = n; job.bcast = 0;
+    int nc = job.nthreads * CHUNKS_PER_THREAD; if (nc > n) nc = n;
+    job.fn = fn; job.ctx = ctx; job.n = n; job.nchunks = nc; job.bcast = 0;
+    __atomic_store_n(&job.next, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&job.done, 0, __ATOMIC_RELAXED);
     __atomic_fetch_add(&job.gen, 1, __ATOMIC_RELEASE);
-    run_chunk(0);
+    run_chunks();
     while (__atomic_load_n(&job.done, __ATOMIC_ACQUIRE) < (u32)(job.nthreads - 1)) cpu_pause();
 }
 static void broadcast(task_fn fn, void* ctx) {
@@ -469,6 +480,20 @@ static int read_key(EFI_INPUT_KEY* k, int wait) {
         }
         if (!wait) return 0;
     }
+}
+// While the model runs (prompt and reply): every pending wheel movement and key, so scrolling
+// keeps up however slow a token is. Called by the engine between layers (g_poll) and once per
+// token; at most every ~15 ms. Esc is remembered in stop_req, other keys are dropped.
+static volatile int stop_req;
+static u64 poll_tsc, poll_every;
+static void poll_input(void) {
+    u64 t = rdtsc();
+    if (t - poll_tsc < poll_every) return;
+    poll_tsc = t;
+    int z = wheel(); if (z) scroll_view(z);
+    EFI_INPUT_KEY k;
+    while (ST->ConIn->ReadKeyStroke(ST->ConIn, &k) == EFI_SUCCESS)
+        if (!scroll_key(&k) && k.ScanCode == SCAN_ESC) stop_req = 1;
 }
 // For menus: every key, nothing intercepted; the wheel moves the selection.
 static void read_key_raw(EFI_INPUT_KEY* k) {
@@ -976,6 +1001,8 @@ static const char HELP[] =
     "/remember text    add a line to MEMORY.TXT, the model reads it in new chats\n"
     "/memory           show MEMORY.TXT\n"
     "/forget           clear MEMORY.TXT\n"
+    "/off              save the chat and power off\n"
+    "/reboot           save the chat and restart\n"
     "Esc               stop a reply\n"
     "PgUp PgDn, arrows, mouse wheel   scroll\n"
     "Home End          top, bottom\n";
@@ -1061,6 +1088,14 @@ static void chat(void) {
             } else say(COL_DIM, "kept", 0);
             continue;
         }
+        if (streq(line, n, "/off") || streq(line, n, "/shutdown") || streq(line, n, "/reboot")) {
+            int off = line[1] != 'r';
+            if (n_seg && save_chat()) write_failed();
+            say(COL_DIM, off ? "powering off" : "restarting", 0);
+            ST->RuntimeServices->ResetSystem(off ? EfiResetShutdown : EfiResetCold, EFI_SUCCESS, 0, 0);
+            say(COL_ERR, "the firmware didn't power off, hold the power button", 0);  // ResetSystem doesn't return
+            continue;
+        }
         if (streq(line, n, "/retry")) {
             if (!last_n) { say(COL_DIM, "nothing to retry", 0); continue; }
             memcpy(line, last, last_n); n = last_n; pos = last_pos0; first = last_first;
@@ -1081,15 +1116,17 @@ static void chat(void) {
         }
         first = 0;
         tr_turn(1, line, n);
+        stop_req = 0; poll_every = tsc_hz / 64; poll_tsc = 0;
+        g_poll = poll_input;   // scroll keys work while the model runs
         // prefill
         float* lg = eng_forward_batch(&E, toks, nt, pos, 0);
         pos += nt;
         // generate
         float temp = S.temp100 >= 0 ? S.temp100 / 100.0f : S.think ? 0.6f : 0.7f;
         float top_p = S.topp100 >= 0 ? S.topp100 / 100.0f : S.think ? 0.95f : 0.8f;
-        u64 t0 = rdtsc(); int gen = 0, thinking = 0;
+        u64 t0 = rdtsc(); int gen = 0, thinking = E.think_open;   // the prompt may already open <think>
         u32 reply0 = tr_n;
-        md_reset(COL_TEXT);
+        md_reset(thinking ? COL_DIM : COL_TEXT);
         for (;;) {
             int t = eng_sample(&E, lg, temp, top_p, S.topk, &rng);
             if (t == (int)E.h->tok_im_end || t == (int)E.h->tok_eot) break;
@@ -1103,12 +1140,13 @@ static void chat(void) {
             gen++;
             con_flush();
             if (gen % 8 == 0) show_stats(gen / secs(rdtsc() - t0), pos);
-            EFI_INPUT_KEY k;
-            if (read_key(&k, 0) && k.ScanCode == SCAN_ESC) { md_finish(); say(COL_DIM, "stopped", 0); break; }
+            poll_tsc = 0; poll_input();
+            if (stop_req) { md_finish(); say(COL_DIM, "stopped", 0); break; }
             if (pos >= E.max_seq - 1) { md_finish(); say(COL_DIM, "context full", 0); break; }
             if (S.max_reply && gen >= S.max_reply) { md_finish(); say(COL_DIM, "reply length limit", 0); break; }
             lg = eng_forward(&E, t, pos++, 1);
         }
+        g_poll = 0;
         md_finish();
         // the reply text went straight into the transcript; register it as a turn
         u32 rl = tr_n - reply0; tr_n = reply0;

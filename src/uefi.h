@@ -147,12 +147,17 @@ typedef struct { u32 Type; u32 Pad; u64 PhysicalStart, VirtualStart, NumberOfPag
 #define EfiConventionalMemory 7
 #define EFI_BUFFER_TOO_SMALL EFI_ERR(5)
 
-// ---- runtime services (only GetTime) ----
+// ---- runtime services (GetTime, ResetSystem) ----
 typedef struct { u16 Year; u8 Month, Day, Hour, Minute, Second, Pad1; u32 Nanosecond; short TimeZone; u8 Daylight, Pad2; } EFI_TIME;
 typedef struct EFI_RUNTIME_SERVICES {
     EFI_TABLE_HEADER Hdr;
     EFI_STATUS (EFIAPI *GetTime)(EFI_TIME*, void* Capabilities);
+    void *SetTime, *GetWakeupTime, *SetWakeupTime, *SetVirtualAddressMap, *ConvertPointer;
+    void *GetVariable, *GetNextVariableName, *SetVariable, *GetNextHighMonotonicCount;
+    void (EFIAPI *ResetSystem)(u32 Type, EFI_STATUS Status, UINTN DataSize, void* Data);
 } EFI_RUNTIME_SERVICES;
+#define EfiResetCold 0
+#define EfiResetShutdown 2
 
 // ---- pointer (mouse wheel = RelativeMovementZ) ----
 typedef struct { i32 RelativeMovementX, RelativeMovementY, RelativeMovementZ; BOOLEAN LeftButton, RightButton; } EFI_SIMPLE_POINTER_STATE;
