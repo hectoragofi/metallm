@@ -1,0 +1,9 @@
+# export.py, gguf_read.py, bin_info.py
+numpy>=2.0
+torch>=2.4
+safetensors>=0.4
+transformers>=5.0   # tokenizer files + chat templates; tests also use the models as reference
+huggingface_hub>=0.30
+# tools/gen_font.py
+pillow>=10.0
+fonttools>=4.40

@@ -1,0 +1,17 @@
+build/
+model/
+model-*/
+usb/
+*.BIN
+*.B[0-9][0-9]
+*.gguf
+*.safetensors
+*.img
+__pycache__/
+.claude/
+# files the app writes to the stick
+CHATS/
+LOG.TXT
+SETTINGS.TXT
+MEMORY.TXT
+NOTES.TXT
